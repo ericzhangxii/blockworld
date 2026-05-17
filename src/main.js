@@ -1,11 +1,23 @@
 import * as THREE from 'three';
 import { PointerLockControls } from 'three/examples/jsm/controls/PointerLockControls.js';
+import { blockMaterials, blockIconUrls } from './textures.js';
+import { initAudio, playStep, playJump, playBreak, playPlace } from './sounds.js';
+import {
+  hasSave,
+  writeSave,
+  readSave,
+  SAVE_VERSION,
+  nextDefaultWorldName,
+} from './save.js';
 
 const BLOCK = 1;
 const WORLD_SIZE = 24;
 const EYE_HEIGHT = 1.6;
 const PLAYER_RADIUS = 0.35;
 const MOVE_SPEED = 5;
+const GROUND_ACCEL = 50;
+const AIR_ACCEL = 12;
+const GROUND_FRICTION = 14;
 const JUMP_SPEED = 8.4;
 const GRAVITY = 32;
 const AIR_DRAG = 0.98;
@@ -15,12 +27,14 @@ const FALL_DEATH_Y = -100;
 const MAX_DELTA = 1 / 30;
 const _moveDir = new THREE.Vector3();
 const _right = new THREE.Vector3();
+const _inputDir = new THREE.Vector3();
+const horizontalVelocity = new THREE.Vector3();
 const SPAWN = new THREE.Vector3(0, BLOCK + EYE_HEIGHT, 4);
 
-const COLORS = {
-  grass: 0x5a9e3a,
-  dirt: 0x8b6914,
-  stone: 0x888888,
+const BLOCK_NAMES = {
+  grass: 'Grass',
+  dirt: 'Dirt',
+  stone: 'Stone',
 };
 const STACK_MAX = 64;
 const HOTBAR_SIZE = 9;
@@ -40,6 +54,7 @@ const camera = new THREE.PerspectiveCamera(
 camera.position.copy(SPAWN);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 document.body.appendChild(renderer.domElement);
@@ -50,11 +65,6 @@ sun.position.set(12, 20, 8);
 scene.add(ambient, sun);
 
 const blockGeo = new THREE.BoxGeometry(BLOCK, BLOCK, BLOCK);
-const materials = {
-  grass: new THREE.MeshLambertMaterial({ color: COLORS.grass }),
-  dirt: new THREE.MeshLambertMaterial({ color: COLORS.dirt }),
-  stone: new THREE.MeshLambertMaterial({ color: COLORS.stone }),
-};
 
 const blocks = new Map();
 const solids = [];
@@ -68,7 +78,7 @@ function addBlock(x, y, z, type = 'grass') {
   const key = blockKey(x, y, z);
   if (blocks.has(key)) return;
 
-  const mesh = new THREE.Mesh(blockGeo, materials[type]);
+  const mesh = new THREE.Mesh(blockGeo, blockMaterials[type]);
   mesh.position.set(x + 0.5, y + 0.5, z + 0.5);
   mesh.userData = { key, x, y, z, type };
   scene.add(mesh);
@@ -125,7 +135,7 @@ function buildWorld() {
 
 buildWorld();
 
-const controls = new PointerLockControls(camera, document.body);
+const controls = new PointerLockControls(camera, renderer.domElement);
 const hint = document.getElementById('hint');
 const crosshair = document.getElementById('crosshair');
 const restartBtn = document.getElementById('restart');
@@ -133,11 +143,331 @@ const hotbarEl = document.getElementById('hotbar');
 const inventoryPanel = document.getElementById('inventory-panel');
 const inventoryGridEl = document.getElementById('inventory-grid');
 const inventoryHotbarEl = document.getElementById('inventory-hotbar');
+const itemTooltip = document.getElementById('item-tooltip');
+const menuOverlay = document.getElementById('menu-overlay');
+const menuTitle = document.getElementById('menu-title');
+const pauseMenu = document.getElementById('pause-menu');
+const controlsMenu = document.getElementById('controls-menu');
+const settingsMenu = document.getElementById('settings-menu');
+const mainMenuOverlay = document.getElementById('main-menu-overlay');
+const menuLogo = document.getElementById('menu-logo');
+const mainMenuButtons = document.getElementById('main-menu-buttons');
+const mainNewGameScreen = document.getElementById('main-new-game-screen');
+const worldNameInput = document.getElementById('world-name-input');
+const mainSettingsScreen = document.getElementById('main-settings-screen');
+const playCatcher = document.getElementById('play-catcher');
 const raycaster = new THREE.Raycaster();
+
+function blockDisplayName(type) {
+  return BLOCK_NAMES[type] ?? type;
+}
+
+function showItemTooltip(type, clientX, clientY) {
+  itemTooltip.textContent = blockDisplayName(type);
+  itemTooltip.style.left = `${clientX}px`;
+  itemTooltip.style.top = `${clientY}px`;
+  itemTooltip.style.display = 'block';
+}
+
+function hideItemTooltip() {
+  itemTooltip.style.display = 'none';
+}
+
+function bindSlotTooltip(el, index) {
+  el.addEventListener('mouseenter', (e) => {
+    const { type } = slots[index];
+    if (type) showItemTooltip(type, e.clientX, e.clientY);
+  });
+  el.addEventListener('mousemove', (e) => {
+    const { type } = slots[index];
+    if (type) showItemTooltip(type, e.clientX, e.clientY);
+  });
+  el.addEventListener('mouseleave', hideItemTooltip);
+}
 
 const slots = Array.from({ length: INVENTORY_SIZE }, () => ({ type: null, count: 0 }));
 let selectedSlot = 0;
 let inventoryOpen = false;
+let menuScreen = null;
+let onMainMenu = false;
+let currentWorldName = '';
+
+function isMenuOpen() {
+  return menuScreen !== null;
+}
+
+function isOnMainMenu() {
+  return onMainMenu;
+}
+
+function isGamePaused() {
+  return isMenuOpen() || inventoryOpen || onMainMenu;
+}
+
+function updateHudVisibility() {
+  const hideHotbar = inventoryOpen || isMenuOpen() || onMainMenu;
+  hotbarEl.style.visibility = hideHotbar ? 'hidden' : 'visible';
+  restartBtn.style.display = isMenuOpen() || onMainMenu ? 'none' : 'block';
+}
+
+function showMenuScreen(screen) {
+  menuScreen = screen;
+  pauseMenu.classList.toggle('active', screen === 'pause');
+  controlsMenu.classList.toggle('active', screen === 'controls');
+  settingsMenu.classList.toggle('active', screen === 'settings');
+  menuTitle.style.display = screen === 'pause' ? 'block' : 'none';
+}
+
+function showMainMenuScreen(screen) {
+  mainMenuButtons.classList.toggle('active', screen === 'buttons');
+  mainNewGameScreen.classList.toggle('active', screen === 'new-game');
+  mainSettingsScreen.classList.toggle('active', screen === 'settings');
+  menuLogo.style.display = screen === 'buttons' ? 'block' : 'none';
+}
+
+function openNewGameScreen() {
+  worldNameInput.value = '';
+  showMainMenuScreen('new-game');
+  worldNameInput.focus();
+}
+
+function resolveWorldName(input) {
+  const trimmed = input.trim();
+  return trimmed || nextDefaultWorldName();
+}
+
+function updateLoadGameButton() {
+  const loadBtn = mainMenuButtons.querySelector('[data-main="load-game"]');
+  if (!loadBtn) return;
+  const data = readSave();
+  const saved = Boolean(data);
+  loadBtn.disabled = !saved;
+  loadBtn.style.opacity = saved ? '1' : '0.55';
+  loadBtn.style.cursor = saved ? 'pointer' : 'not-allowed';
+  loadBtn.textContent = data?.worldName ? `Load Game: ${data.worldName}` : 'Load Game';
+}
+
+function collectSaveState() {
+  const blockList = [];
+  for (const [key, entry] of blocks) {
+    const [x, y, z] = key.split(',').map(Number);
+    blockList.push({ x, y, z, type: entry.type });
+  }
+  return {
+    version: SAVE_VERSION,
+    worldName: currentWorldName,
+    player: {
+      position: camera.position.toArray(),
+      rotation: [camera.rotation.x, camera.rotation.y, camera.rotation.z],
+    },
+    velocity: {
+      vertical: verticalVelocity,
+      horizontal: [horizontalVelocity.x, horizontalVelocity.z],
+    },
+    blocks: blockList,
+    inventory: slots.map((s) => ({ type: s.type, count: s.count })),
+    selectedSlot,
+  };
+}
+
+function applySaveState(data) {
+  if (!data || data.version !== SAVE_VERSION || !Array.isArray(data.blocks)) {
+    return false;
+  }
+
+  clearWorld();
+  for (const block of data.blocks) {
+    if (!blockMaterials[block.type]) continue;
+    addBlock(block.x, block.y, block.z, block.type);
+  }
+
+  camera.position.fromArray(data.player.position);
+  camera.rotation.set(
+    data.player.rotation[0],
+    data.player.rotation[1],
+    data.player.rotation[2]
+  );
+  verticalVelocity = data.velocity?.vertical ?? 0;
+  horizontalVelocity.set(
+    data.velocity?.horizontal?.[0] ?? 0,
+    0,
+    data.velocity?.horizontal?.[1] ?? 0
+  );
+
+  for (let i = 0; i < INVENTORY_SIZE; i++) {
+    const slot = data.inventory[i] ?? { type: null, count: 0 };
+    slots[i].type = slot.type;
+    slots[i].count = slot.count;
+  }
+  selectedSlot = data.selectedSlot ?? 0;
+  currentWorldName = data.worldName ?? 'Saved World';
+  renderInventoryUI();
+  return true;
+}
+
+function saveCurrentGame() {
+  writeSave(collectSaveState());
+}
+
+function quitAndExit() {
+  saveCurrentGame();
+  openMainMenu();
+}
+
+function loadSavedGame() {
+  const data = readSave();
+  return data ? applySaveState(data) : false;
+}
+
+function clearWorld() {
+  for (const key of [...blocks.keys()]) {
+    removeBlock(key);
+  }
+}
+
+function resetInventory() {
+  for (let i = 0; i < INVENTORY_SIZE; i++) {
+    slots[i].type = null;
+    slots[i].count = 0;
+  }
+  selectedSlot = 0;
+  renderInventoryUI();
+}
+
+function closeMainMenu() {
+  onMainMenu = false;
+  mainMenuOverlay.classList.remove('open');
+  showMainMenuScreen('buttons');
+  updateHudVisibility();
+  updatePlayCatcher();
+  if (!inventoryOpen && !controls.isLocked) hint.style.display = 'block';
+}
+
+function openMainMenu() {
+  if (inventoryOpen) closeInventory();
+  menuOverlay.classList.remove('open');
+  menuScreen = null;
+  pauseMenu.classList.remove('active');
+  controlsMenu.classList.remove('active');
+  settingsMenu.classList.remove('active');
+
+  onMainMenu = true;
+  mainMenuOverlay.classList.add('open');
+  showMainMenuScreen('buttons');
+  controls.unlock();
+  crosshair.classList.remove('active');
+  hint.style.display = 'none';
+  updateLoadGameButton();
+  updatePlayCatcher();
+  updateHudVisibility();
+}
+
+function startNewGame(worldName) {
+  currentWorldName = worldName;
+  clearWorld();
+  buildWorld();
+  restartPlayer();
+  resetInventory();
+  saveCurrentGame();
+  closeMainMenu();
+}
+
+function closeInventory() {
+  if (!inventoryOpen) return;
+  inventoryOpen = false;
+  inventoryPanel.classList.remove('open');
+  if (controls.isLocked) crosshair.classList.add('active');
+  updateHudVisibility();
+  updatePlayCatcher();
+  renderInventoryUI();
+}
+
+function openPauseMenu() {
+  if (inventoryOpen) closeInventory();
+  menuOverlay.classList.add('open');
+  showMenuScreen('pause');
+  controls.unlock();
+  crosshair.classList.remove('active');
+  hint.style.display = 'none';
+  updatePlayCatcher();
+  updateHudVisibility();
+}
+
+function resumeGame(lockPointer = false) {
+  if (onMainMenu) return;
+  menuOverlay.classList.remove('open');
+  menuScreen = null;
+  pauseMenu.classList.remove('active');
+  controlsMenu.classList.remove('active');
+  settingsMenu.classList.remove('active');
+  updateHudVisibility();
+  if (lockPointer) {
+    initAudio();
+    controls.lock();
+  } else {
+    updatePlayCatcher();
+    if (!inventoryOpen) hint.style.display = 'block';
+  }
+}
+
+menuOverlay.addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-menu]');
+  if (!btn) return;
+  e.stopPropagation();
+
+  switch (btn.dataset.menu) {
+    case 'resume':
+      resumeGame(true);
+      break;
+    case 'controls':
+      showMenuScreen('controls');
+      break;
+    case 'settings':
+      showMenuScreen('settings');
+      break;
+    case 'quit-exit':
+      quitAndExit();
+      break;
+    case 'back':
+      showMenuScreen('pause');
+      break;
+  }
+});
+
+worldNameInput.addEventListener('keydown', (e) => {
+  if (e.code === 'Enter') {
+    e.preventDefault();
+    startNewGame(resolveWorldName(worldNameInput.value));
+  }
+});
+
+mainMenuOverlay.addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-main]');
+  if (!btn) return;
+  e.stopPropagation();
+
+  switch (btn.dataset.main) {
+    case 'new-game':
+      openNewGameScreen();
+      break;
+    case 'start-game':
+      startNewGame(resolveWorldName(worldNameInput.value));
+      break;
+    case 'load-game':
+      if (!hasSave()) return;
+      if (loadSavedGame()) closeMainMenu();
+      break;
+    case 'settings':
+      showMainMenuScreen('settings');
+      break;
+    case 'quit':
+      window.close();
+      break;
+    case 'back':
+      showMainMenuScreen('buttons');
+      break;
+  }
+});
 
 function swapSlots(a, b) {
   const temp = { ...slots[a] };
@@ -172,7 +502,8 @@ function createSlotEl(index, showKey) {
   el.className = 'inv-slot';
   el.dataset.index = String(index);
   if (index === selectedSlot && index < HOTBAR_SIZE) el.classList.add('selected');
-  if (showKey && index < HOTBAR_SIZE) el.title = `Slot ${index + 1}`;
+
+  bindSlotTooltip(el, index);
 
   el.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -193,7 +524,8 @@ function fillSlotEl(el, slot) {
 
   const icon = document.createElement('div');
   icon.className = 'block-icon';
-  icon.style.background = `#${COLORS[slot.type].toString(16).padStart(6, '0')}`;
+  icon.style.backgroundImage = `url(${blockIconUrls[slot.type]})`;
+  icon.style.backgroundSize = 'cover';
 
   const count = document.createElement('span');
   count.className = 'count';
@@ -226,15 +558,17 @@ function renderInventoryUI() {
 }
 
 function toggleInventory() {
-  inventoryOpen = !inventoryOpen;
-  inventoryPanel.classList.toggle('open', inventoryOpen);
-  hotbarEl.style.visibility = inventoryOpen ? 'hidden' : 'visible';
+  if (isMenuOpen() || onMainMenu) return;
   if (inventoryOpen) {
-    controls.unlock();
-    crosshair.classList.remove('active');
-  } else if (controls.isLocked) {
-    crosshair.classList.add('active');
+    closeInventory();
+    return;
   }
+  inventoryOpen = true;
+  inventoryPanel.classList.add('open');
+  controls.unlock();
+  crosshair.classList.remove('active');
+  updateHudVisibility();
+  updatePlayCatcher();
   renderInventoryUI();
 }
 
@@ -244,6 +578,7 @@ function restartPlayer() {
   camera.position.copy(SPAWN);
   camera.rotation.set(0, 0, 0);
   verticalVelocity = 0;
+  horizontalVelocity.set(0, 0, 0);
   keys.w = false;
   keys.a = false;
   keys.s = false;
@@ -255,12 +590,31 @@ restartBtn.addEventListener('click', (e) => {
   restartPlayer();
 });
 
+function canLockPointer() {
+  return !controls.isLocked && !inventoryOpen && !isMenuOpen() && !onMainMenu;
+}
+
+function updatePlayCatcher() {
+  playCatcher.classList.toggle('visible', canLockPointer());
+}
+
+function tryLockPointer() {
+  if (!canLockPointer()) return;
+  initAudio();
+  controls.lock();
+}
+
+playCatcher.addEventListener('click', (e) => {
+  e.stopPropagation();
+  tryLockPointer();
+});
+
 renderer.domElement.addEventListener('click', () => {
-  if (!controls.isLocked) controls.lock();
+  tryLockPointer();
 });
 
 document.addEventListener('mousedown', (e) => {
-  if (inventoryOpen || !controls.isLocked) return;
+  if (inventoryOpen || isMenuOpen() || onMainMenu || !controls.isLocked) return;
   if (e.button === 0) breakTargetedBlock();
   if (e.button === 2) placeTargetedBlock();
 });
@@ -270,15 +624,25 @@ renderer.domElement.addEventListener('contextmenu', (e) => e.preventDefault());
 controls.addEventListener('lock', () => {
   hint.style.display = 'none';
   crosshair.classList.add('active');
+  updatePlayCatcher();
 });
 
 controls.addEventListener('unlock', () => {
-  hint.style.display = 'block';
   crosshair.classList.remove('active');
+  updatePlayCatcher();
+  if (!isMenuOpen() && !inventoryOpen && !onMainMenu) hint.style.display = 'block';
 });
+
+document.addEventListener('pointerlockchange', () => {
+  updatePlayCatcher();
+});
+
+updatePlayCatcher();
 
 const keys = { w: false, a: false, s: false, d: false };
 let verticalVelocity = 0;
+let footstepTimer = 0;
+const FOOTSTEP_INTERVAL = 0.42;
 const clock = new THREE.Clock();
 
 function feetY() {
@@ -295,16 +659,37 @@ function overlapsXZ(x, z, solid) {
 }
 
 function onGround() {
+  return getGroundBlockType() !== null;
+}
+
+function getGroundBlockType() {
   const feet = feetY();
   for (const solid of solids) {
     if (
       Math.abs(feet - solid.maxY) < 0.05 &&
       overlapsXZ(camera.position.x, camera.position.z, solid)
     ) {
-      return true;
+      const entry = blocks.get(solid.key);
+      if (entry) return entry.type;
     }
   }
-  return false;
+  return null;
+}
+
+function isMoving() {
+  return Math.hypot(horizontalVelocity.x, horizontalVelocity.z) > 0.35;
+}
+
+function updateFootsteps(delta) {
+  if (!onGround() || !isMoving()) {
+    footstepTimer = 0;
+    return;
+  }
+  footstepTimer -= delta;
+  if (footstepTimer <= 0) {
+    playStep(getGroundBlockType() ?? 'grass');
+    footstepTimer = FOOTSTEP_INTERVAL;
+  }
 }
 
 function resolveVertical(prev) {
@@ -348,31 +733,61 @@ function resolveHorizontal() {
 
     if (overlapX < overlapZ) {
       const solidCenterX = (solid.minX + solid.maxX) / 2;
-      camera.position.x =
+      const newX =
         px > solidCenterX ? solid.maxX + PLAYER_RADIUS : solid.minX - PLAYER_RADIUS;
+      if (newX !== px) horizontalVelocity.x = 0;
+      camera.position.x = newX;
     } else {
       const solidCenterZ = (solid.minZ + solid.maxZ) / 2;
-      camera.position.z =
+      const newZ =
         pz > solidCenterZ ? solid.maxZ + PLAYER_RADIUS : solid.minZ - PLAYER_RADIUS;
+      if (newZ !== pz) horizontalVelocity.z = 0;
+      camera.position.z = newZ;
     }
   }
 }
 
 function applyMovement(delta) {
-  if (!controls.isLocked || inventoryOpen) return;
+  if (!controls.isLocked || isGamePaused()) return;
 
   camera.getWorldDirection(_moveDir);
   _moveDir.y = 0;
-  if (_moveDir.lengthSq() < 1e-8) return;
-  _moveDir.normalize();
+  if (_moveDir.lengthSq() < 1e-8) _moveDir.set(0, 0, -1);
+  else _moveDir.normalize();
 
   _right.crossVectors(_moveDir, camera.up).normalize();
-  const step = MOVE_SPEED * delta;
 
-  if (keys.w) camera.position.addScaledVector(_moveDir, step);
-  if (keys.s) camera.position.addScaledVector(_moveDir, -step);
-  if (keys.d) camera.position.addScaledVector(_right, step);
-  if (keys.a) camera.position.addScaledVector(_right, -step);
+  _inputDir.set(0, 0, 0);
+  if (keys.w) _inputDir.add(_moveDir);
+  if (keys.s) _inputDir.sub(_moveDir);
+  if (keys.d) _inputDir.add(_right);
+  if (keys.a) _inputDir.sub(_right);
+
+  const grounded = onGround();
+  const hasInput = _inputDir.lengthSq() > 0;
+
+  if (hasInput) {
+    _inputDir.normalize();
+    const accel = grounded ? GROUND_ACCEL : AIR_ACCEL;
+    horizontalVelocity.x += _inputDir.x * accel * delta;
+    horizontalVelocity.z += _inputDir.z * accel * delta;
+
+    const speed = Math.hypot(horizontalVelocity.x, horizontalVelocity.z);
+    if (speed > MOVE_SPEED) {
+      const scale = MOVE_SPEED / speed;
+      horizontalVelocity.x *= scale;
+      horizontalVelocity.z *= scale;
+    }
+  } else if (grounded) {
+    const damp = Math.max(0, 1 - GROUND_FRICTION * delta);
+    horizontalVelocity.x *= damp;
+    horizontalVelocity.z *= damp;
+    if (Math.abs(horizontalVelocity.x) < 0.02) horizontalVelocity.x = 0;
+    if (Math.abs(horizontalVelocity.z) < 0.02) horizontalVelocity.z = 0;
+  }
+
+  camera.position.x += horizontalVelocity.x * delta;
+  camera.position.z += horizontalVelocity.z * delta;
 }
 
 function raycastBlock() {
@@ -382,26 +797,43 @@ function raycastBlock() {
   return raycaster.intersectObjects(blockMeshes, false);
 }
 
-function blockOverlapsPlayer(x, y, z) {
-  const minX = x;
-  const maxX = x + BLOCK;
-  const minY = y;
+function canPlaceAt(x, y, z) {
   const maxY = y + BLOCK;
-  const minZ = z;
-  const maxZ = z + BLOCK;
+  const feet = feetY();
   const px = camera.position.x;
-  const py = feetY();
   const pz = camera.position.z;
   const headY = camera.position.y;
 
-  return (
-    px + PLAYER_RADIUS > minX &&
-    px - PLAYER_RADIUS < maxX &&
-    pz + PLAYER_RADIUS > minZ &&
-    pz - PLAYER_RADIUS < maxZ &&
-    headY > minY &&
-    py < maxY
-  );
+  const xzOverlap =
+    px + PLAYER_RADIUS > x &&
+    px - PLAYER_RADIUS < x + BLOCK &&
+    pz + PLAYER_RADIUS > z &&
+    pz - PLAYER_RADIUS < z + BLOCK;
+
+  if (!xzOverlap) return true;
+
+  // Allow pillar/clutch: block top is at or below feet
+  if (maxY <= feet + 0.05) return true;
+
+  return !(headY > y && feet < maxY);
+}
+
+function tryPlaceBelowFeet(type) {
+  const feet = feetY();
+  const bx = Math.floor(camera.position.x);
+  const bz = Math.floor(camera.position.z);
+  const by = Math.floor(feet - 0.001) - 1;
+
+  if (by < 0) return false;
+  if (blocks.has(blockKey(bx, by, bz))) return false;
+  if (!canPlaceAt(bx, by, bz)) return false;
+
+  addBlock(bx, by, bz, type);
+  return true;
+}
+
+function isLookingDown() {
+  return camera.rotation.x > 0.45;
 }
 
 function breakTargetedBlock() {
@@ -410,12 +842,31 @@ function breakTargetedBlock() {
 
   const { key } = hits[0].object.userData;
   const removed = removeBlock(key);
-  if (removed) addToInventory(removed);
+  if (removed) {
+    addToInventory(removed);
+    playBreak(removed);
+  }
+}
+
+function consumeSlotItem() {
+  const slot = slots[selectedSlot];
+  slot.count--;
+  if (slot.count <= 0) {
+    slot.type = null;
+    slot.count = 0;
+  }
+  renderInventoryUI();
 }
 
 function placeTargetedBlock() {
   const slot = slots[selectedSlot];
   if (!slot.type || slot.count <= 0) return;
+
+  if (!onGround() && isLookingDown() && tryPlaceBelowFeet(slot.type)) {
+    playPlace(slot.type);
+    consumeSlotItem();
+    return;
+  }
 
   const hits = raycastBlock();
   if (hits.length === 0) return;
@@ -428,31 +879,68 @@ function placeTargetedBlock() {
   const bz = z + Math.round(n.z);
 
   if (blocks.has(blockKey(bx, by, bz))) return;
-  if (blockOverlapsPlayer(bx, by, bz)) return;
+  if (!canPlaceAt(bx, by, bz)) return;
 
   addBlock(bx, by, bz, slot.type);
-  slot.count--;
-  if (slot.count <= 0) {
-    slot.type = null;
-    slot.count = 0;
-  }
-  renderInventoryUI();
+  playPlace(slot.type);
+  consumeSlotItem();
 }
 
-document.addEventListener('keydown', (e) => {
+function isTypingInUI() {
+  const el = document.activeElement;
+  return (
+    el &&
+    (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)
+  );
+}
+
+document.addEventListener(
+  'keydown',
+  (e) => {
+  if (e.code === 'Escape') {
+    e.preventDefault();
+    if (onMainMenu) {
+      if (
+        mainSettingsScreen.classList.contains('active') ||
+        mainNewGameScreen.classList.contains('active')
+      ) {
+        showMainMenuScreen('buttons');
+      }
+      return;
+    }
+    if (inventoryOpen) {
+      closeInventory();
+      return;
+    }
+    if (menuScreen === 'controls' || menuScreen === 'settings') {
+      showMenuScreen('pause');
+      return;
+    }
+    if (menuScreen === 'pause') {
+      resumeGame(false);
+      return;
+    }
+    openPauseMenu();
+    return;
+  }
+
+  if (isTypingInUI()) return;
+
   if (e.code === 'KeyE') {
     toggleInventory();
     e.preventDefault();
     return;
   }
-  if (inventoryOpen) return;
+  if (inventoryOpen || isMenuOpen() || onMainMenu) return;
 
   if (e.code === 'KeyW') keys.w = true;
   if (e.code === 'KeyA') keys.a = true;
   if (e.code === 'KeyS') keys.s = true;
   if (e.code === 'KeyD') keys.d = true;
   if (e.code === 'Space' && controls.isLocked && onGround()) {
+    playJump(getGroundBlockType() ?? 'grass');
     verticalVelocity = JUMP_SPEED;
+    footstepTimer = FOOTSTEP_INTERVAL * 0.5;
     e.preventDefault();
   }
   const digit = e.code.match(/^Digit([1-9])$/);
@@ -460,16 +948,19 @@ document.addEventListener('keydown', (e) => {
     selectedSlot = Number(digit[1]) - 1;
     renderInventoryUI();
   }
-});
+  },
+  true
+);
 
 document.addEventListener('wheel', (e) => {
-  if (inventoryOpen || !controls.isLocked) return;
+  if (inventoryOpen || isMenuOpen() || onMainMenu || !controls.isLocked) return;
   selectedSlot = (selectedSlot + (e.deltaY > 0 ? 1 : -1) + HOTBAR_SIZE) % HOTBAR_SIZE;
   renderInventoryUI();
   e.preventDefault();
 }, { passive: false });
 
 document.addEventListener('keyup', (e) => {
+  if (isTypingInUI()) return;
   if (e.code === 'KeyW') keys.w = false;
   if (e.code === 'KeyA') keys.a = false;
   if (e.code === 'KeyS') keys.s = false;
@@ -483,6 +974,12 @@ window.addEventListener('resize', () => {
 });
 
 function animate() {
+  if (isGamePaused()) {
+    clock.getDelta();
+    renderer.render(scene, camera);
+    return;
+  }
+
   const delta = Math.min(clock.getDelta(), MAX_DELTA);
   const prev = camera.position.clone();
 
@@ -495,6 +992,7 @@ function animate() {
   }
   camera.position.y += verticalVelocity * delta;
   resolveVertical(prev);
+  updateFootsteps(delta);
 
   if (feetY() < FALL_DEATH_Y) restartPlayer();
 
